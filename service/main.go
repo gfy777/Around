@@ -15,6 +15,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -38,16 +39,33 @@ type Post struct {
 	Message  string   `json:"message"`
 	Location Location `json:"location"`
 	Url      string   `json:"url"`
+	Type     string   `json:"type"`
+	Face     bool     `json:"face"`
 }
 
 const (
-	INDEX            = "" // ES index
-	TYPE             = "" // ES type
-	DISTANCE         = "" // default distance
-	EsUrl            = "" // ES IP address and port
-	BucketName       = "" // GCS bucket name, can be found in GCP storage
-	ProjectId        = "" // GCP project ID
-	BigtableInstance = "" // GCP BigTable instance id
+	INDEX            = "around"
+	TYPE             = "post"
+	DISTANCE         = "200km"
+	EsUrl            = "http://35.193.149.251:9200"
+	BucketName       = "post-images-286400"
+	ProjectId        = "orbital-heaven-286400"
+	BigtableInstance = "around-post"
+	API_PREFIX       = "/api/v1"
+)
+
+var (
+	mediaType = map[string]string{
+		".jpeg": "image",
+		".jpg":  "image",
+		".gif":  "image",
+		".png":  "image",
+		".mov":  "video",
+		".mp4":  "video",
+		".avi":  "video",
+		".flv":  "video",
+		".wmv":  "video",
+	}
 )
 
 var mySigningKey = []byte("secret") // secret key for JWT, please use more complicated key in production
@@ -101,12 +119,18 @@ func main() {
 	})
 
 	// register the url pattern and http handler function
-	r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
-	r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
-	r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
-	r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+	r.Handle(API_PREFIX+"/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+	r.Handle(API_PREFIX+"/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+	r.Handle(API_PREFIX+"/search-face", jwtMiddleware.Handler(http.HandlerFunc(handlerSearchFace))).Methods("GET")
+	r.Handle(API_PREFIX+"/login", http.HandlerFunc(loginHandler)).Methods("POST")
+	r.Handle(API_PREFIX+"/signup", http.HandlerFunc(signupHandler)).Methods("POST")
 
-	http.Handle("/", r)
+	//backend endpoint
+	http.Handle(API_PREFIX+"/", r)
+
+	//frontend endpoint
+	http.Handle("/", http.FileServer(http.Dir("build")))
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
@@ -159,13 +183,22 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	id := uuid.New()
 
 	// handle the upload image
-	file, _, err := r.FormFile("image")
+	file, header, err := r.FormFile("image")
 	if err != nil {
 		http.Error(w, "GCS is not setup", http.StatusInternalServerError)
 		fmt.Printf("GCS is not setup %v\n", err)
 		panic(err)
 	}
 	defer file.Close()
+
+	// figure out the file type
+	fileExt := filepath.Ext(header.Filename)
+
+	if t, ok := mediaType[fileExt]; ok {
+		p.Type = t
+	} else {
+		p.Type = "unknown"
+	}
 
 	// save to GCS
 	ctx := context.Background()
@@ -177,6 +210,15 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.Url = attrs.MediaLink
+
+	// GCP Vision API
+	if faceDetected, err := detectFacesURI(attrs.MediaLink); err != nil {
+		http.Error(w, "Failed to annotate the image", http.StatusInternalServerError)
+		fmt.Printf("Failed to annotate the image %v\n", err)
+		panic(err)
+	} else {
+		p.Face = faceDetected
+	}
 
 	// save to ES
 	saveToES(p, id)
@@ -263,6 +305,11 @@ func saveToES(p *Post, id string) {
 }
 
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
 	fmt.Println("Received one request for search")
 	// get parameter from URL
 	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
@@ -310,9 +357,63 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// write results
+	_, _ = w.Write(js)
+}
+
+func handlerSearchFace(w http.ResponseWriter, r *http.Request) {
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	fmt.Println("Received one request for search face")
+	// get parameter from URL
+	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
+	ran := DISTANCE
+	if val := r.URL.Query().Get("range"); val != "" {
+		ran = val + "km"
+	}
+	fmt.Printf("Search received: %f, %f %s\n", lat, lon, ran)
+
+	// built connection to elastic service
+	client, err := elastic.NewClient(elastic.SetURL(EsUrl), elastic.SetSniff(false))
+	if err != nil {
+		panic(err)
+	}
+
+	// query name- can choose any name, here we use location
+	// query all results in the range
+	q := elastic.NewMatchQuery("face", "true")
+
+	searchResult, err := client.Search().Index(INDEX).Query(q).Pretty(true).Do(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Query took %d milliseconds\n", searchResult.TookInMillis)
+	fmt.Printf("Found a total of %d posts\n", searchResult.TotalHits())
+
+	// convert ES query results to our defined structure- Post
+	var ps []Post
+	// reflect to tell elastic the type of data- here is 'Post'
+	for _, item := range searchResult.Each(reflect.TypeOf(Post{})) {
+		p := item.(Post) // golang type assertions- assert item to Post (our structure)
+		fmt.Printf("Post by %s: %s at lat %v and lon %v\n", p.User, p.Message, p.Location.Lat, p.Location.Lon)
+		if !containsFilteredWords(&p.Message) {
+			ps = append(ps, p)
+		}
+	}
+
+	// use json package convert slices of Post to json format
+	js, err := json.Marshal(ps)
+	if err != nil {
+		panic(err)
+	}
+
+	// write results
 	_, _ = w.Write(js)
+
 }
 
 func containsFilteredWords(s *string) bool {
